@@ -1,0 +1,151 @@
+# 工作中间件聚合 (podman): skillsui-knowanchor + light-kb 本地开发共用一套, 不再分多个 compose 分组.
+# 迁自 (应用本体不进本分组, 仍在各自仓库 compose 里跑):
+#   - agent-os/skillsui-knowanchor/.deploy/podman/compose.yaml  -> postgres / mysql / redis (原项目名 podman)
+#   - agent-os/light-kb/.deploy/podman/compose.yaml             -> rocketmq 本地栈 (原项目名 light-kb)
+# 数据卷沿用原卷名 (podman_ 前缀是原项目名残留, 为无缝继承旧数据不改名):
+#   pg: db_agent_knowanchor (knowanchor) + db_light_kb (light-kb) 共用实例, 账号 rwuser
+#   mysql: knowanchor 业务库 (rpuser / db_knowanchor), root 免密
+#   rocketmq: heavy-job-task / heavy-job-result topic 预建, proxy grpc 8081 对宿主发布
+# 连接方式: 宿主进程 127.0.0.1:<port>; 其他 compose 分组的容器用 host.containers.internal:<port>
+#   (分组间服务名不互通; 分组内如本文件注释中 pg_isready 用的都是服务名)
+# 密钥只进同目录 .env (不入 git; 首次部署从 knowanchor 项目根 .env 拷 POSTGRES_PASSWORD / MYSQL_PASSWORD).
+name: work
+
+services:
+  postgres:
+    image: docker.io/pgvector/pgvector:pg16    # postgres + 预装 pgvector 扩展 (knowanchor pgvector 后端用)
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST:-127.0.0.1}          # 连接信息随容器自带 (podman exec env 可查); 容器间互连用服务名 postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-rwuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在同目录 .env 配置}
+      POSTGRES_DB: ${POSTGRES_DB:-db_agent_knowanchor}    # 仅首次初始化生效; 库内其他库 (如 db_light_kb) 不受影响
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mysql:
+    image: docker.io/library/mysql:8
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_HOST: ${MYSQL_HOST:-127.0.0.1}                # 连接信息随容器自带 (podman exec env 可查); 容器间互连用服务名 mysql
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-rpuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在同目录 .env 配置}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-db_knowanchor}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: docker.io/library/redis:8
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+
+  # ---- RocketMQ 5.x 本地栈 (light-kb): nameserver + broker + proxy (grpc 对宿主发布) ----
+  # 端口/JVM 堆/topic 清单走同目录 .env (ROCKETMQ_* / MQ_TOPICS);
+  # broker 内部约定 (brokerIP1 = 服务名 / listenPort 10911 / 集群名) 是分组内契约, 保持硬编码勿 env 化.
+  # 应用侧连接: MQ_ENDPOINT = 127.0.0.1:$ROCKETMQ_PROXY_PORT (容器间 host.containers.internal)
+  rocketmq-namesrv:
+    image: docker.io/apache/rocketmq:5.3.2
+    restart: unless-stopped
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "${ROCKETMQ_NAMESRV_HEAP:--Xms256m -Xmx256m -Xmn128m}"
+    ports:
+      - "${ROCKETMQ_NAMESRV_PORT:-9876}:9876"
+
+  # broker 配置进程内生成 (内容与 docker 形态的 rocketmq/broker.conf 一致, 勿漂移):
+  # brokerIP1 须为服务名供 proxy 解析; autoCreateTopic 仅为 dev 便利
+  rocketmq-broker:
+    image: docker.io/apache/rocketmq:5.3.2
+    restart: unless-stopped
+    environment:
+      JAVA_OPT_EXT: "${ROCKETMQ_BROKER_HEAP:--Xms512m -Xmx512m -Xmn128m}"
+    command:
+      - sh
+      - -c
+      - |
+        printf '%s\n' \
+          'brokerClusterName = DefaultCluster' \
+          'brokerName = broker-a' \
+          'brokerId = 0' \
+          'brokerIP1 = rocketmq-broker' \
+          'listenPort = 10911' \
+          'autoCreateTopicEnable = true' \
+          'autoCreateSubscriptionGroup = true' \
+          'flushDiskType = ASYNC_FLUSH' \
+          > /tmp/broker.conf
+        exec sh mqbroker -n rocketmq-namesrv:9876 -c /tmp/broker.conf
+    # 健康语义 = 已在 nameserver 完成注册 (broker JVM 启动需 ~40s, 起完前 proxy 建系统 topic 必失败)
+    healthcheck:
+      test: ["CMD-SHELL", "JAVA_OPT_EXT='-Xms128m -Xmx128m' sh mqadmin clusterList -n rocketmq-namesrv:9876 2>/dev/null | grep -q broker-a"]
+      interval: 10s
+      timeout: 15s
+      retries: 18
+      start_period: 30s
+    depends_on:
+      - rocketmq-namesrv
+
+  rocketmq-proxy:
+    image: docker.io/apache/rocketmq:5.3.2
+    command: sh mqproxy -n rocketmq-namesrv:9876
+    environment:
+      JAVA_OPT_EXT: "${ROCKETMQ_PROXY_HEAP:--Xms512m -Xmx512m -Xmn128m}"
+    restart: unless-stopped
+    ports:
+      - "${ROCKETMQ_PROXY_PORT:-8081}:8081"
+    depends_on:
+      rocketmq-broker:
+        condition: service_healthy
+
+  # topic 预建 (一次性): autoCreateTopicEnable 只在发布时兜底, 消费者起手拉路由需要 topic 先存在
+  rocketmq-topics:
+    image: docker.io/apache/rocketmq:5.3.2
+    restart: "no"
+    environment:
+      JAVA_OPT_EXT: "-Xms128m -Xmx128m"
+    command:
+      - sh
+      - -c
+      - |
+        for t in ${MQ_TOPICS:-heavy-job-task heavy-job-result}; do
+          sh mqadmin updateTopic -n rocketmq-namesrv:9876 -c DefaultCluster -t "$$t"
+        done
+        echo topics ready
+    depends_on:
+      rocketmq-broker:
+        condition: service_healthy
+
+volumes:
+  # external: 继承自旧 podman 项目的外部卷 (compose 只用不建不删; 换新机器需先迁数据再 up, 否则报卷不存在)
+  pg-data:
+    name: podman_knowanchor-pg-data
+    external: true
+  mysql-data:
+    name: podman_knowanchor-mysql-data
+    external: true
+  redis-data:
+    name: podman_redis-data
+    external: true
