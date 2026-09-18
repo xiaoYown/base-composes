@@ -5,7 +5,7 @@
 # 数据卷沿用原卷名 (podman_ 前缀是原项目名残留, 为无缝继承旧数据不改名):
 #   pg: db_agent_knowanchor (knowanchor) + db_light_kb (light-kb) 共用实例, 账号 rwuser
 #   mysql: knowanchor 业务库 (rpuser / db_knowanchor), root 免密
-#   rocketmq: heavy-job-task / heavy-job-result topic 预建, proxy grpc 8081 对宿主发布
+#   rocketmq: job-task / job-result topic 预建, proxy grpc 8081 对宿主发布
 # 连接方式: 宿主进程 127.0.0.1:<port>; 其他 compose 分组的容器用 host.containers.internal:<port>
 #   (分组间服务名不互通; 分组内如本文件注释中 pg_isready 用的都是服务名)
 # 密钥只进同目录 .env (不入 git; 首次部署从 knowanchor 项目根 .env 拷 POSTGRES_PASSWORD / MYSQL_PASSWORD).
@@ -130,7 +130,7 @@ services:
       - sh
       - -c
       - |
-        for t in ${MQ_TOPICS:-heavy-job-task heavy-job-result}; do
+        for t in ${MQ_TOPICS:-job-task job-result}; do
           sh mqadmin updateTopic -n rocketmq-namesrv:9876 -c DefaultCluster -t "$$t"
         done
         echo topics ready
