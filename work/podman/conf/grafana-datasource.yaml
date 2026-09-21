@@ -1,0 +1,18 @@
+# grafana clickhouse 数据源自动 provisioning (compose: grafana 服务)
+# $CLICKHOUSE_* 由 grafana provisioning 的 env 插值展开 (bind 文件不经 compose 插值, 无需 $$ 转义)
+apiVersion: 1
+datasources:
+  - name: clickhouse
+    uid: clickhouse
+    type: grafana-clickhouse-datasource
+    isDefault: true
+    access: proxy
+    url: http://clickhouse:8123
+    jsonData:
+      defaultDatabase: db_logs
+      protocol: http
+      server: clickhouse          # 新版插件连接用 server 而非 url (health check 亦然)
+      port: 8123
+      username: $CLICKHOUSE_USER
+    secureJsonData:
+      password: $CLICKHOUSE_PASSWORD

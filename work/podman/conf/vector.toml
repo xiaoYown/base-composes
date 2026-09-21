@@ -1,0 +1,88 @@
+# vector: 双入口清洗归一 -> clickhouse 攒批写入 (契约: 库 db_logs / 表 logs / 容器网 8123)
+# 凭据占位符 __CLICKHOUSE_USER__/__CLICKHOUSE_PASSWORD__ 由 compose entrypoint sed 从 env 注入
+data_dir = "/var/lib/vector"
+
+# fluent-bit forward 协议入口 (容器网内, 不对宿主发布)
+[sources.fluent_in]
+type = "fluent"
+address = "0.0.0.0:24224"
+
+# 应用直推入口 (对宿主发布 $VECTOR_HTTP_PORT), 每行一个 JSON 对象
+# OTLP 遥测不经 vector (timberio 发行版不产 OTLP log 事件): 走 otelcol 服务 -> db_logs.otel_logs
+[sources.http_in]
+type = "http"
+address = "0.0.0.0:8686"
+decoding.codec = "json"
+
+# 清洗归一到 logs 表列结构; 消息体本身是 JSON 行时提升结构化字段
+[transforms.normalize]
+type = "remap"
+inputs = ["fluent_in", "http_in"]
+source = '''
+# 消息体: 文件链路在 .log (fluent-bit tail), 直推/otlp 链路在 .message
+# 注意 VRL 的 to_string(null) 返回空串而非 error, ?? 兜底不触发, 须用 is_string 守卫;
+# 守卫内用 ! 断言函数收敛类型 (编译器不跟踪跨分支类型合并)
+message = ""
+if is_string(.log) { message = to_string!(.log) }
+if message == "" && is_string(.message) { message = to_string!(.message) }
+source = ""
+if is_string(.service) { source = to_string!(.service) }
+level = ""
+if is_string(.level) { level = to_string!(.level) }
+filepath = ""
+if is_string(.file) { filepath = to_string!(.file) }
+
+ingress = if filepath != "" { "file" } else { "http" }
+
+# 常见应用 JSON 日志行: 整体解析后提升 message/level/service
+p, perr = parse_json(message)
+if perr == null && is_object(p) {
+    if is_string(p.message) { message = to_string!(p.message) }
+    if is_string(p.level) { level = to_string!(p.level) }
+    if is_string(p.service) { source = to_string!(p.service) }
+}
+
+# 文件链路 source 取文件名 (如 app.log); level 缺失按关键词粗判
+if filepath != "" {
+    source = replace!(filepath, r'^.*/', "")
+}
+if level == "" {
+    up = upcase!(message)
+    if contains(up, "ERROR") || contains(up, "FATAL") {
+        level = "error"
+    } else if contains(up, "WARN") {
+        level = "warn"
+    } else if contains(up, "DEBUG") || contains(up, "TRACE") {
+        level = "debug"
+    } else {
+        level = "info"
+    }
+}
+if source == "" { source = "app" }
+
+# 白名单重构事件: 其余杂项字段交给 skip_unknown_fields 丢弃
+. = {
+    "message": message,
+    "level": downcase!(level),
+    "source": source,
+    "host": get_hostname() ?? "vector",
+    "attributes": {"ingress": ingress, "file": filepath},
+    "timestamp": .timestamp,
+}
+'''
+
+[sinks.ch]
+type = "clickhouse"
+inputs = ["normalize"]
+endpoint = "http://clickhouse:8123"
+database = "db_logs"
+table = "logs"
+format = "json_each_row"
+compression = "gzip"
+auth.strategy = "basic"
+auth.user = "__CLICKHOUSE_USER__"
+auth.password = "__CLICKHOUSE_PASSWORD__"
+date_time_best_effort = true      # RFC3339 -> DateTime64
+skip_unknown_fields = true
+batch.max_events = 1000           # 大批次写入, 降低 parts 写放大
+batch.timeout_secs = 1

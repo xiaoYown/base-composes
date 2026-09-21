@@ -23,7 +23,7 @@ esac
 # 顶层 volumes 声明: 输出 "卷key 声明名 ext|int" (external 用声明名; 其余实际名为 <项目名>_key)
 volume_decls() {
   awk '
-    function emit() { if (key != "") print key, name, (ext ? "ext" : "int") }
+    function emit() { if (key != "") { print key, name, (ext ? "ext" : "int"); key = "" } }
     /^volumes:/ { invol = 1; next }
     invol && /^[^ ]/ { invol = 0; emit(); next }
     invol && /^  [-A-Za-z0-9_.]+: *$/ { emit(); key = $0; gsub(/[ :]/, "", key); name = ""; ext = 0; next }
