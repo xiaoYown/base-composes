@@ -1,0 +1,8 @@
+.env
+.env.example
+.gitignore
+Dockerfile
+mw.sh
+scripts/
+PLAN.md
+data/

@@ -1,0 +1,91 @@
+# ELK 日志栈 (podman): 轻量两容器 fluent-bit + clickhouse, 自 work/podman 日志栈裁撤迁出
+# (vector/otelcol/grafana 已裁撤, 裁撤决策与自研 UI 计划见本目录 PLAN.md; 旧实现 git 历史可回溯)
+# 链路: fluent-bit 单容器收三入口 -> lua 归一清洗 -> out_http 直写 clickhouse HTTP INSERT (JSONEachRow)
+#   入口 1 tail: $LOGS_DIR/*.log (含一级子目录; virtiofs 轮询 5s)
+#   入口 2 http : 127.0.0.1:$FB_HTTP_PORT (每行一个 JSON 对象; 兼容任意路径 POST)
+#   入口 3 otlp : 127.0.0.1:$OTLP_HTTP_PORT (OTLP/HTTP+JSON, OTel SDK 出口; 仅 logs 信号)
+#   注意: OTLP resource 属性 (service.name) 在 fluent-bit 输入侧不透传, source 兜底 'otlp'
+# podman machine 挂载约束 (projects machine 实测): 仅 /Users 与 /var/folders 可 bind mount,
+#   故 LOGS_DIR 必须位于上述路径下; 全部配置不走 bind mount, 由 compose env 内嵌注入进程内落盘.
+# 分组内契约 (硬编码勿 env 化): 库 db_logs / 表 logs / 三入口 tag logs.file|http|otlp; ch 8123.
+#   建表折叠进 clickhouse /docker-entrypoint-initdb.d (仅数据卷首次初始化执行; 改 TTL 需 ALTER).
+# 连接方式: 宿主进程 127.0.0.1:<port>; 其他 compose 分组容器用 host.containers.internal:<port>.
+# 密钥只进同目录 .env (不入 git).
+name: elk
+
+services:
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.3
+    restart: unless-stopped
+    ulimits:
+      nofile: 262144
+    environment:
+      CLICKHOUSE_DB: db_logs                          # 仅首次建卷生效; 通用账号 admin (同 work 组惯例)
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
+      # 首次建卷时由 entrypoint 执行 (幂等); $LOG_TTL_DAYS 由 compose 插值固化进 SQL
+      INIT_SQL: |
+        CREATE TABLE IF NOT EXISTS db_logs.logs (
+            timestamp   DateTime64(3) CODEC(Delta, ZSTD(1)),
+            message     String CODEC(ZSTD(3)),
+            level       LowCardinality(String),
+            source      LowCardinality(String),
+            host        LowCardinality(String),
+            attributes  Map(String, String) CODEC(ZSTD(1)),
+            INDEX token_msg message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4
+        ) ENGINE = MergeTree
+        PARTITION BY toDate(timestamp)
+        ORDER BY (source, timestamp)
+        TTL toDateTime(timestamp) + INTERVAL ${LOG_TTL_DAYS:-30} DAY
+        SETTINGS ttl_only_drop_parts = 1;
+    command:
+      - sh
+      - -c
+      - |
+        printf '%s\n' "$$INIT_SQL" > /docker-entrypoint-initdb.d/00-logs.sql
+        # 不带参数调用 entrypoint (带非 -- 参数会跳过用户/库/initdb 初始化直接 exec)
+        exec /entrypoint.sh
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123"    # HTTP 查询面 (自研 UI 对接这里; 也是 fluent-bit 写入口的宿主侧入口)
+      - "127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"  # native; 宿主 clickhouse-client 直连
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      # CLICKHOUSE_USER 改名后 default 不存在, 必须显式带凭据
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # 采集+清洗+写入单容器: 三入口 (tag 区分) -> lua 归一到 logs 表列结构 -> http 直写 CH
+  # 发行版镜像 distroless 无 shell 且 machine 挂载约束不能 bind mount -> 配置经本地 build 打进镜像 (conf/)
+  # 改 conf/ 后需: podman compose -f compose.yaml build fluent-bit && .. up -d fluent-bit
+  # 凭据 ${FB_CH_*} 由 fluent-bit 运行时 env 插值 (conf 不经 compose 插值)
+  fluent-bit:
+    build: .
+    image: localhost/elk/fluent-bit:local
+    restart: unless-stopped
+    command:
+      - -c
+      - /fluent-bit/etc/fluent-bit.conf
+      - -R
+      - /fluent-bit/etc/parsers.conf
+    environment:
+      FB_HOST: ${FB_HOST:-fluent-bit}
+      FB_CH_USER: ${CLICKHOUSE_USER:-admin}
+      FB_CH_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
+    ports:
+      - "127.0.0.1:${FB_HTTP_PORT:-8686}:8686"     # 应用直推 (JSON 行)
+      - "127.0.0.1:${OTLP_HTTP_PORT:-4318}:4318"   # OTLP/HTTP; OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+    volumes:
+      # 须位于 /Users 或 /var/folders 下 (podman machine 挂载约束, 见文件头注释)
+      - ${LOGS_DIR:?请在 .env 配置 LOGS_DIR (且须位于 /Users 或 /var/folders 下)}:/var/log/apps:ro
+      - fluentbit-state:/fluent-bit/tail_db
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+volumes:
+  clickhouse-data:
+  fluentbit-state:

@@ -6,16 +6,13 @@
 #   pg: db_default (knowanchor) + db_light_kb (light-kb) 共用实例
 #   mysql: knowanchor 业务库 (db_default), root 免密
 #   rocketmq: job-task / job-result topic 预建, proxy grpc 8081 对宿主发布
-#   日志栈: fluent-bit -> vector -> clickhouse (db_logs.logs) + grafana 查询; 宿主 bind 数据统一放 data/
+# 日志栈已迁出至 elk/podman (fluent-bit + clickhouse 两容器轻量方案, 见其 PLAN.md).
 # 通用账号: pg / mysql 统一 admin (各项目共用, 密码在同目录 .env); 任何 db_name 一律 db_ 前缀
 # 连接方式: 宿主进程 127.0.0.1:<port>; 其他 compose 分组的容器用 host.containers.internal:<port>
 #   (分组间服务名不互通; 分组内如本文件注释中 pg_isready 用的都是服务名)
 # 密钥只进同目录 .env (不入 git).
-# machine 重建 (数据卷需先 export, 见 podman volume export/import):
-#   podman machine init projects --memory 6144 --cpus 5 \
-#     -v /Users:/Users -v /private:/private -v /var/folders:/var/folders \
-#     -v ~/.config/containers:/etc/containers -v /Volumes/Projects-01:/Volumes/Projects-01
-#   (-v 显式传参为全集覆盖, 缺一项对应共享即失效)
+# machine 挂载约束 (projects machine 2026-09 实测): 仅 /Users 与 /var/folders 可 bind mount
+#   (本分组现无 bind mount 不受影响; 需挂载的新分组注意此约束; 重建 machine 挂载清单会变, 以实测为准)
 name: work
 
 services:
@@ -145,127 +142,6 @@ services:
       rocketmq-broker:
         condition: service_healthy
 
-  # ---- 日志栈: fluent-bit -> vector -> clickhouse (db_logs.logs) + grafana 查询 ----
-  # 接入: 文件日志放 $LOGS_DIR (默认 ./data/fluent-bit, *.log 含一级子目录) 或 HTTP 直推 $VECTOR_HTTP_PORT (JSON 行).
-  # 分组内契约 (硬编码勿 env 化): 库 db_logs / 表 logs / fluent 24224 / ch 8123; 配置文件在 conf/ (bind mount).
-  clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.3
-    restart: unless-stopped
-    ulimits:
-      nofile: 262144
-    environment:
-      CLICKHOUSE_DB: db_logs                          # 仅首次建卷生效 (账号/密码同); 通用账号 admin
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
-    ports:
-      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123"    # HTTP; vector/grafana 走容器网, 此口给宿主 clickhouse-client --url
-      - "127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"  # native; 宿主 clickhouse-client 直连
-    volumes:
-      - clickhouse-data:/var/lib/clickhouse
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-
-  # 建库建表 (一次性, 幂等): 按天分区 + TTL $LOG_TTL_DAYS + ZSTD; 改 TTL 对已建表无效需 ALTER
-  clickhouse-init:
-    image: docker.io/clickhouse/clickhouse-server:26.3
-    restart: "no"
-    environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
-      LOG_TTL_DAYS: ${LOG_TTL_DAYS:-30}
-    command:
-      - sh
-      - -c
-      - |
-        sed "s/__TTL_DAYS__/$${LOG_TTL_DAYS:-30}/" /init.sql \
-          | clickhouse-client -h clickhouse --user "$${CLICKHOUSE_USER:-admin}" --password "$$CLICKHOUSE_PASSWORD" --multiquery
-        echo logs table ready
-    volumes:
-      - ./conf/clickhouse-init.sql:/init.sql:ro
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-
-  # 日志网关: fluent 24224 + http 8686 + otlp 4317/4318 三入口 -> VRL 清洗 -> 攒批 (1000条/1s, gzip) 写 clickhouse
-  # 配置进程内 sed 注入凭据 (conf/vector.toml 占位符; vector env 插值默认禁用; 密码避开 | 字符)
-  vector:
-    image: docker.io/timberio/vector:0.58.0-debian
-    restart: unless-stopped
-    entrypoint:
-      - sh
-      - -c
-      - |
-        sed -e "s|__CLICKHOUSE_USER__|$${CLICKHOUSE_USER}|" \
-            -e "s|__CLICKHOUSE_PASSWORD__|$${CLICKHOUSE_PASSWORD}|" \
-            /etc/vector/vector.tpl > /etc/vector/vector.toml
-        exec vector --config /etc/vector/vector.toml
-    environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
-    ports:
-      - "127.0.0.1:${VECTOR_HTTP_PORT:-8686}:8686"
-    volumes:
-      - ./conf/vector.toml:/etc/vector/vector.tpl:ro
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-
-  # 采集: tail $LOGS_DIR (默认 ./data/fluent-bit, 相对 compose.yaml); 偏移 DB 持久化防重采
-  fluent-bit:
-    image: docker.io/fluent/fluent-bit:5.0.10
-    restart: unless-stopped
-    volumes:
-      - ${LOGS_DIR:-./data/fluent-bit}:/var/log/apps:ro
-      - fluentbit-state:/fluent-bit/tail_db
-      - ./conf/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
-    depends_on:
-      - vector
-
-  # OTLP 遥测网关: OTel SDK 标准接入 (4317 gRPC / 4318 HTTP) -> clickhouse db_logs.otel_logs (表由 exporter 自建)
-  # 应用侧: OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:$OTLP_HTTP_PORT (容器间 host.containers.internal)
-  otelcol:
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.161.0
-    restart: unless-stopped
-    environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
-    ports:
-      - "127.0.0.1:${OTLP_GRPC_PORT:-4317}:4317"
-      - "127.0.0.1:${OTLP_HTTP_PORT:-4318}:4318"
-    volumes:
-      - ./conf/otelcol.yaml:/etc/otelcol-contrib/config.yaml:ro
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-
-  # 查询: clickhouse 插件预装 + datasource 自动 provisioning (首启联网); 用 Explore > Logs
-  grafana:
-    image: docker.io/grafana/grafana:12.1
-    restart: unless-stopped
-    environment:
-      GF_PLUGINS_PREINSTALL: grafana-clickhouse-datasource   # GF_INSTALL_PLUGINS 已弃用
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?请在同目录 .env 配置}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}          # 供 datasource provisioning 插值 ($$CLICKHOUSE_*)
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请在同目录 .env 配置}
-    ports:
-      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./conf/grafana-datasource.yaml:/etc/grafana/provisioning/datasources/clickhouse.yaml:ro
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-
 volumes:
   # external: 继承自旧 podman 项目的外部卷 (compose 只用不建不删; 换新机器需先迁数据再 up, 否则报卷不存在)
   pg-data:
@@ -277,7 +153,3 @@ volumes:
   redis-data:
     name: podman_redis-data
     external: true
-  # 日志栈内部卷 (compose 自建, 实际名 work_<key>; mw.sh 卸载语义与 external 卷区分)
-  clickhouse-data:
-  grafana-data:
-  fluentbit-state:

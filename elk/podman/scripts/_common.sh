@@ -1,4 +1,4 @@
-# 日志栈测试脚本公共库: .env 解析 + clickhouse/vector 访问封装 (macOS bash 3.2 兼容, 零依赖)
+# ELK 日志栈脚本公共库: .env 解析 + clickhouse/fluent-bit 访问封装 (macOS bash 3.2 兼容, 零依赖)
 # 不直接执行; 由 logs-*.sh source
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,9 +18,10 @@ env_val() {  # $1=变量名 $2=默认值
 CH_HTTP_PORT=$(env_val CLICKHOUSE_HTTP_PORT 8123)
 CH_USER=$(env_val CLICKHOUSE_USER admin)
 CH_PASS=$(env_val CLICKHOUSE_PASSWORD clickhouse123456)
-VECTOR_PORT=$(env_val VECTOR_HTTP_PORT 8686)
-OTLP_PORT=$(env_val VECTOR_OTLP_HTTP_PORT 4318)
-LOGS_SRC="$ROOT/data/fluent-bit"
+FB_HTTP_PORT=$(env_val FB_HTTP_PORT 8686)      # fluent-bit 直推入口 (每行一个 JSON 对象)
+OTLP_PORT=$(env_val OTLP_HTTP_PORT 4318)       # fluent-bit OTLP/HTTP 入口
+LOGS_SRC=$(env_val LOGS_DIR "")                # 文件采集目录 (tail 源)
+[ -n "$LOGS_SRC" ] || { echo "请在 .env 配置 LOGS_DIR (且须位于 /Users 或 /var/folders 下)" >&2; exit 1; }
 
 # clickhouse HTTP 查询 (stdout 即结果)
 ch_query() { curl -sm 10 "http://127.0.0.1:$CH_HTTP_PORT/" -u "$CH_USER:$CH_PASS" --data-binary "$1"; }
