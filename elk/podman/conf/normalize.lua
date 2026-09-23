@@ -7,9 +7,19 @@
 --           (fluent-bit >= 4.0.4 五参形态; 仅 protobuf 路径填充 group/metadata, JSON 手构载荷不保证)
 -- 白名单 ATTR_KEYS 是与 light-kb (arch-observability) 的双端契约, 改清单须双端同步
 
+-- 键面来源: light-kb Go 侧全仓日志键普查 (slog 键值对), 按使用面分组
 local ATTR_KEYS = {
-  "service.name", "request_id", "stack", "event", "error",
-  "job_id", "lane", "caller", "trace_id",
+  -- 通用: 身份与错误
+  "service.name", "request_id", "trace_id", "err", "stack", "event", "error",
+  -- 任务与编排 (ingest / taskflow)
+  "job_id", "lane", "caller", "type",
+  -- 依赖探活 (dep_probe / supervised / server_deps 汇总)
+  "dep", "status", "attempts", "deps", "down",
+  -- 数据定位
+  "kb_id", "doc_id", "tenant_id", "table",
+  -- 访问日志 (httpx AccessLog)
+  "method", "path", "duration_ms",
+  -- 异常 (Python traceback 自动映射)
   "exception.type", "exception.message", "exception.stacktrace",
 }
 
@@ -90,7 +100,9 @@ function normalize(cb_tag, ts, group, metadata, record)
   end)
 
   -- 白名单属性: record attrs 优先, resource attrs 兜底 (service.name 恒来自 resource)
-  local attrs = { ingress = ingress, file = file }
+  -- file 仅 tail 入口有值 (OTLP/http 入口无此概念), 空不落键避免属性面常驻空串
+  local attrs = { ingress = ingress }
+  if file ~= "" then attrs["file"] = file end
   for _, key in ipairs(ATTR_KEYS) do
     local v = scalar_str(ot_attrs[key])
     if v == nil then v = scalar_str(res_attrs[key]) end
