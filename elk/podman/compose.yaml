@@ -3,8 +3,10 @@
 # 链路: fluent-bit 单容器收三入口 -> lua 归一清洗 -> out_http 直写 clickhouse HTTP INSERT (JSONEachRow)
 #   入口 1 tail: $LOGS_DIR/*.log (含一级子目录; virtiofs 轮询 5s)
 #   入口 2 http : 127.0.0.1:$FB_HTTP_PORT (每行一个 JSON 对象; 兼容任意路径 POST)
-#   入口 3 otlp : 127.0.0.1:$OTLP_HTTP_PORT (OTLP/HTTP+JSON, OTel SDK 出口; 仅 logs 信号)
-#   注意: OTLP resource 属性 (service.name) 在 fluent-bit 输入侧不透传, source 兜底 'otlp'
+#   入口 3 otlp : 127.0.0.1:$OTLP_HTTP_PORT (OTLP/HTTP, OTel SDK 出口; 仅 logs 信号, 须 protobuf 编码)
+#   OTLP 字段提取: normalize.lua 走 lua extended callback (5 参, fluent-bit >= 4.0.4)
+#   - group.resource.attributes -> source (service.name) 与白名单属性; metadata.otlp -> level (severity_text) 与 record attrs
+#   - 仅 protobuf 路径填充 group/metadata (真实 OTel SDK 默认); JSON 手构载荷会被丢弃, e2e 走 SDK 造数
 # podman machine 挂载约束 (projects machine 实测): 仅 /Users 与 /var/folders 可 bind mount,
 #   故 LOGS_DIR 必须位于上述路径下; 全部配置不走 bind mount, 由 compose env 内嵌注入进程内落盘.
 # 分组内契约 (硬编码勿 env 化): 库 db_logs / 表 logs / 三入口 tag logs.file|http|otlp; ch 8123.

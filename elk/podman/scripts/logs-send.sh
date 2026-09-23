@@ -39,19 +39,29 @@ send_http() {
   [ "$ok" = "$n" ] || exit 1
 }
 
-send_otlp() {  # OTLP/HTTP + JSON 编码 (protobuf-JSON 映射), 等价 OTel SDK 的 logs exporter
-  ok=0
-  for ((i = 1; i <= n; i++)); do
-    lv=$(echo "$levels" | cut -d' ' -f$(( (i - 1) % 3 + 1 )))
-    sev=$(echo "$lv" | tr '[:lower:]' '[:upper:]')
-    body=$(printf '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"e2e-otlp"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"%s000000000","severityText":"%s","body":{"stringValue":"[%s] otlp-%s %s OTLP 遥测链路测试日志"}}]}]}]}' \
-      "$(date +%s)" "$sev" "$tag" "$i" "$lv")
-    code=$(curl -sm 5 -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$OTLP_PORT/v1/logs" \
-      -H 'content-type: application/json' -d "$body") || code=000
-    case "$code" in 2*) ok=$((ok + 1)) ;; esac
-  done
-  echo "otlp: 成功 $ok/$n (标记 $tag)"
-  [ "$ok" = "$n" ] || exit 1
+send_otlp() {  # OTLP/HTTP + protobuf (真实 OTel SDK 形态; JSON 手构载荷在 lua extended callback 下会被丢弃)
+  # 依赖本机 uv 临时环境 (opentelemetry-sdk); 带 record attrs 验证白名单提取
+  uv run --no-project -q --with "opentelemetry-sdk>=1.44" --with "opentelemetry-exporter-otlp-proto-http>=1.44" \
+    python -c "
+import logging
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+
+provider = LoggerProvider(resource=Resource.create({'service.name': 'e2e-otlp'}))
+provider.add_log_record_processor(BatchLogRecordProcessor(
+    OTLPLogExporter(endpoint='http://127.0.0.1:$OTLP_PORT/v1/logs', timeout=5)))
+logging.basicConfig(level=logging.INFO, handlers=[LoggingHandler(level=logging.INFO, logger_provider=provider)], force=True)
+log = logging.getLogger('e2e')
+levels = ['info', 'warn', 'error']
+for i in range($n):
+    lv = levels[i % 3]
+    getattr(log, lv)('[$tag] otlp-%d %s OTLP 遥测链路测试日志' % (i + 1, lv),
+                     extra={'request_id': '$tag', 'stack': 'goroutine 1 [running]:\nmain.e2e()'})
+provider.shutdown()
+" 2>/dev/null || { echo "otlp: 发送失败 (uv 可用?)" >&2; exit 1; }
+  echo "otlp: 已发 $n 条 (标记 $tag, service.name=e2e-otlp)"
 }
 
 case "$link" in
