@@ -43,8 +43,18 @@ clickhouse 26.3  <────────────────────�
 3. **clickhouse entrypoint 陷阱**: `/entrypoint.sh clickhouse-server` (带非 `--` 开头参数) 会跳过
    用户/库/initdb 初始化直接 exec; 必须不带参数调用 (compose 里 command 生成 00-logs.sql 后 `exec /entrypoint.sh`)。
 4. **[PARSER] 段在 5.0 不允许放主配置文件**, 须独立 parsers.conf (`-R` 参数)。
-5. **OTLP 输入的字段映射** (实测): body→`.log`, severityText→嵌套 `.otlp.severity_text`;
-   **resource 属性 (service.name) 不透传**, 故 OTLP 链路 source 兜底为 `otlp` (lua 已按此兜底)。
+5. **OTLP 输入的字段映射** (2026-09-23 复测修订, light-kb otel-logging 期): OTLP logs 的
+   severity/attributes/resource 属性不在 record body, 而在 log event 的 metadata root field 与 group —
+   lua 经 **extended callback (5 参形态, fluent-bit >= 4.0.4 按参数个数自动检测)** 读取:
+   `group.resource.attributes` -> source (service.name) 与 resource 属性 (滤噪后兜底);
+   `metadata.otlp` -> severity_text (level) / record attributes (全收) / trace_id+span_id (裸字节, lua 转 hex 提升)。
+   旧结论 "resource 属性不透传" 是 3 参 classic callback 只见 body map 所致。
+   **仅 protobuf 路径填充 group/metadata** (真实 OTel SDK 默认编码); JSON 手构载荷在 5 参 lua 下被丢弃,
+   造数/e2e 一律走 OTel SDK (uv 临时环境)。
+   **属性契约 (2026-09-24 白名单退役)**: ATTR_KEYS 已废除, 改动态透传 —— 应用打的标量属性全收
+   (otlp record attrs 全收; http/file 顶层杂字段同级提升; resource attrs 滤噪前缀
+   telemetry.sdk./service.instance./service.version/process./os. 后兜底; 复合值跳过, 应用侧自行标量化;
+   保留键 ingress/file)。无键面登记, 新键零改动落库, 不再存在双端清单同步。
 6. **OTLP 仅接了 logs 信号**; 未来要 traces/metrics 时再加回 otelcol (旧配置在 git 历史)。
 7. 数据链路可靠性: tail 偏移 DB 持久化防重采 (fluentbit-state 卷); out_http `Retry_Limit False`
    无限重试 (与原 vector 语义一致); gzip 批量降低 CH parts 写放大。
@@ -85,8 +95,15 @@ clickhouse 26.3  <────────────────────�
 
 ### 阶段 3 — 增强 (按需)
 - 错误聚合 (按 source+level 分组趋势)、日志上下文 (同 source 前后 N 条)、
-  OTLP trace_id 透传与关联跳转 (需先在应用侧把 trace_id 打进日志体)、
+  OTLP trace_id 关联跳转 (管道侧已自动提升 span 上下文的 trace_id/span_id, 待应用侧启用 tracer 后即有数据;
+  见 §2.5)、属性键动态发现 (loupe 侧 arrayJoin(mapKeys(attributes)) facets)。
 - 若接 traces (otelcol 回归), UI 加 trace 检索页。
+- ~~attributes 白名单透传 + OTLP 入口 service 兜底~~ (2026-09-23 已完成, 随 light-kb
+  otel-logging 期落地: normalize.lua extended callback + ATTR_KEYS 白名单, source=service.name,
+  e2e 增白名单断言; 见 §2.5)。
+- ~~ATTR_KEYS 白名单退役, 改动态透传~~ (2026-09-24 完成: 标量属性全收 + resource 滤噪兜底 +
+  http/file 顶层提升 + trace_id/span_id 自动提升; 动机是白名单三端漂移 (lua 24 键 / loupe 6 键 /
+  light-kb 文档) 与新键接入需 rebuild 的维护环, 详见 §2.5 属性契约)。
 
 ### 明确不做
 - 不做告警/采集器下沉/多机聚合 (本地开发场景, 保持 2 容器底座);
@@ -97,6 +114,7 @@ clickhouse 26.3  <────────────────────�
 
 - OTLP gRPC (4317) 未发布: OTel SDK 侧须用 http/protobuf 协议
   (`OTEL_EXPORTER_OTLP_PROTOCOL=http_protobuf`, endpoint `http://127.0.0.1:4318`)。
+  2026-09-23 已实测确认 (Python SDK 默认即 protobuf): JSON 编码载荷在 5 参 lua 下被丢弃, protobuf 路径完整。
 - tail 首扫边界: fluent-bit 启动前已写入文件的旧行不保证回采 (实测增量追加可靠);
   e2e 脚本始终以追加方式造数, 与真实应用写日志行为一致。
 - 高频写入 (万条/秒级) 未压测: 本地开发量级远低于此, out_http 1s flush + gzip 批量应有余量。
