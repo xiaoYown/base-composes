@@ -1,0 +1,24 @@
+# NATS 本地栈 (轻量 MQ 分组, 按需启停): 单 nats-server + JetStream
+# 2026-10-08 新建: RocketMQ 四容器 (namesrv/broker/proxy/topics) 的轻量替代候选
+#   (light-kb MQ provider 化轻档; 单 Go 进程常驻几十 MB, 无 JVM 栈与 topic 预建链)
+# 无数据卷: JetStream store 在容器可写层, 删容器即清空消息与 stream/consumer 声明
+#   (应用侧首连 ensure 重建), 本地栈预期行为 (与 rocketmq 分组口径一致)。
+# 端口走同目录 .env (NATS_*); 应用侧连接: MQ_ENDPOINT = 127.0.0.1:$NATS_CLIENT_PORT
+#   (容器间 host.containers.internal:4222)
+name: nats
+
+services:
+  nats:
+    # alpine 变体 (默认 tag 为 scratch, 无 shell/wget, healthcheck 跑不了)
+    image: docker.io/nats:2.11-alpine
+    restart: unless-stopped
+    # -js 开 JetStream; -m 开 HTTP 监控 (/varz /jsz /healthz)
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "${NATS_CLIENT_PORT:-4222}:4222"
+      - "${NATS_HTTP_PORT:-8222}:8222"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8222/healthz?js-enabled=true' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
