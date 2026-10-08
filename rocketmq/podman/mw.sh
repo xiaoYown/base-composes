@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# work 组中间件: 多选服务再执行 compose 动作 (零依赖, macOS bash 3.2 兼容)
+# RocketMQ 本地栈: 多选服务再执行 compose 动作 (零依赖, macOS bash 3.2 兼容; 与 work/elk 组 mw.sh 同族, 卷前缀取自 name:)
 # 用法: ./mw.sh [up|stop|restart]    默认 up (即 up -d)
 #   up       启动勾选服务; external 卷 compose 只用不建, 缺失时确认后预建空卷 (全新初始化)
 #   stop     停止勾选服务: Enter=仅停容器保留 (compose stop); y=卸载存储 (停+删容器+删数据卷)
 #            数据卷是 external, compose down -v 删不掉, 由本脚本解析 compose.yaml 代删
 #   restart  重启勾选服务 (只对 running 容器生效, compose 语义)
 # 按键: ↑/↓ 移动 | 空格 勾选 | a 全选/清空 | Enter 执行 | q 取消
-# 说明: 勾选会连带依赖 (compose depends_on 语义; 本分组各服务相互独立无依赖)
+# 说明: 勾选会连带依赖 (compose depends_on 语义, 如 proxy 自动带起 broker/namesrv)
 set -uo pipefail
 cd "$(dirname "$0")"
 
 COMPOSE="podman compose -f compose.yaml"
+
+# 项目名 (内部数据卷实际名前缀 <项目名>_key)
+PROJECT=$(awk '/^name:/ {print $2; exit}' compose.yaml)
 
 action="${1:-up}"
 case "$action" in
@@ -64,7 +67,7 @@ chosen_volumes() {
     [ -n "$vk" ] || continue
     for k in ${keys[@]+"${keys[@]}"}; do
       [ "$k" = "$vk" ] || continue
-      real=$vn; [ "$ve" = ext ] || real="work_${vk}"
+      real=$vn; [ "$ve" = ext ] || real="${PROJECT}_${vk}"
       echo "$real $ve"
     done
   done < <(volume_decls)
@@ -151,7 +154,7 @@ render() {
   done
 }
 
-printf '\033[1mwork 中间件\033[0m — 空格勾选 · a 全选/清空 · Enter 执行 %s · q 取消\n' "$action"
+printf '\033[1mRocketMQ 本地栈\033[0m — 空格勾选 · a 全选/清空 · Enter 执行 %s · q 取消\n' "$action"
 render
 while :; do
   IFS= read -rsn1 key || exit 130

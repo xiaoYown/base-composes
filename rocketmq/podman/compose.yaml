@@ -1,0 +1,80 @@
+# RocketMQ 5.x 本地栈 (重型中间件, 独立分组按需启停): nameserver + broker + proxy (grpc 对宿主发布) + topic 预建
+# 2026-10-08 自 work/podman 拆出 (更早迁自 agent-os/light-kb/.deploy/podman, 原项目名 light-kb);
+#   拆出同时服务名去掉 rocketmq- 前缀 (容器名仍为 rocketmq-*), 组内引用 (brokerIP1/依赖/健康检查) 已同步改.
+# 无数据卷: broker store 在容器可写层, 删容器即清空消息与路由 (topic 由 topics 服务 up 时重建), 本地栈预期行为.
+# 端口/JVM 堆/topic 清单走同目录 .env (ROCKETMQ_* / MQ_TOPICS);
+# broker 内部约定 (brokerIP1 = 服务名 broker / listenPort 10911 / 集群名) 是分组内契约, 保持硬编码勿 env 化.
+# 应用侧连接: MQ_ENDPOINT = 127.0.0.1:$ROCKETMQ_PROXY_PORT (容器间 host.containers.internal)
+name: rocketmq
+
+services:
+  namesrv:
+    image: docker.io/apache/rocketmq:5.3.2
+    restart: unless-stopped
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "${ROCKETMQ_NAMESRV_HEAP:--Xms256m -Xmx256m -Xmn128m}"
+    ports:
+      - "${ROCKETMQ_NAMESRV_PORT:-9876}:9876"
+
+  # broker 配置进程内生成 (内容与 docker 形态的 rocketmq/broker.conf 一致, 勿漂移):
+  # brokerIP1 须为服务名供 proxy 解析; autoCreateTopic 仅为 dev 便利
+  broker:
+    image: docker.io/apache/rocketmq:5.3.2
+    restart: unless-stopped
+    environment:
+      JAVA_OPT_EXT: "${ROCKETMQ_BROKER_HEAP:--Xms512m -Xmx512m -Xmn128m}"
+    command:
+      - sh
+      - -c
+      - |
+        printf '%s\n' \
+          'brokerClusterName = DefaultCluster' \
+          'brokerName = broker-a' \
+          'brokerId = 0' \
+          'brokerIP1 = broker' \
+          'listenPort = 10911' \
+          'autoCreateTopicEnable = true' \
+          'autoCreateSubscriptionGroup = true' \
+          'flushDiskType = ASYNC_FLUSH' \
+          > /tmp/broker.conf
+        exec sh mqbroker -n namesrv:9876 -c /tmp/broker.conf
+    # 健康语义 = 已在 nameserver 完成注册 (broker JVM 启动需 ~40s, 起完前 proxy 建系统 topic 必失败)
+    healthcheck:
+      test: ["CMD-SHELL", "JAVA_OPT_EXT='-Xms128m -Xmx128m' sh mqadmin clusterList -n namesrv:9876 2>/dev/null | grep -q broker-a"]
+      interval: 10s
+      timeout: 15s
+      retries: 18
+      start_period: 30s
+    depends_on:
+      - namesrv
+
+  proxy:
+    image: docker.io/apache/rocketmq:5.3.2
+    command: sh mqproxy -n namesrv:9876
+    environment:
+      JAVA_OPT_EXT: "${ROCKETMQ_PROXY_HEAP:--Xms512m -Xmx512m -Xmn128m}"
+    restart: unless-stopped
+    ports:
+      - "${ROCKETMQ_PROXY_PORT:-8081}:8081"
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  # topic 预建 (一次性): autoCreateTopicEnable 只在发布时兜底, 消费者起手拉路由需要 topic 先存在
+  topics:
+    image: docker.io/apache/rocketmq:5.3.2
+    restart: "no"
+    environment:
+      JAVA_OPT_EXT: "-Xms128m -Xmx128m"
+    command:
+      - sh
+      - -c
+      - |
+        for t in ${MQ_TOPICS:-job-task job-result}; do
+          sh mqadmin updateTopic -n namesrv:9876 -c DefaultCluster -t "$$t"
+        done
+        echo topics ready
+    depends_on:
+      broker:
+        condition: service_healthy
