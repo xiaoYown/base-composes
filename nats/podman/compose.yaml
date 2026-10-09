@@ -9,7 +9,7 @@ name: nats
 
 services:
   nats:
-    # alpine 变体 (默认 tag 为 scratch, 无 shell/wget, healthcheck 跑不了)
+    # alpine 变体 (2.11 起 distroless 化: 无 shell/wget, 容器内 HTTP 探活不可用)
     image: docker.io/nats:2.11-alpine
     restart: unless-stopped
     # -js 开 JetStream; -m 开 HTTP 监控 (/varz /jsz /healthz)
@@ -18,7 +18,9 @@ services:
       - "${NATS_CLIENT_PORT:-4222}:4222"
       - "${NATS_HTTP_PORT:-8222}:8222"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8222/healthz?js-enabled=true' || exit 1"]
+      # 进程活性探针 (镜像无探活客户端); JetStream 就绪观察面 = 宿主侧 8222 /healthz
+      # + 应用首连 ensure (supervised 探活即真实功能闸门)
+      test: ["CMD", "nats-server", "-v"]
       interval: 5s
       timeout: 3s
       retries: 10
